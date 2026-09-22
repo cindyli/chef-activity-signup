@@ -2,7 +2,7 @@
 
 Date: 2026-09-22
 Status: Approved
-Source requirements: [docs/requirements.md](../../requirements.md)
+Source requirements: [docs/requirements.md](./requirements.md)
 
 ## 1. Scope and Targets
 
