@@ -1,8 +1,9 @@
 # CHEFS Activity Sign-Up — Architectural Design
 
 Date: 2026-09-22
+Updated: 2026-09-25 (added §12 Internationalization; two admin levels, §4.5; requirements §14 gaps: no-show, admin cancel, activity cancel/reschedule, email)
 Status: Approved
-Source requirements: [docs/requirements.md](./requirements.md)
+Source requirements: [docs/requirements-en.md](./requirements-en.md) ([中文](./requirement-zh.md))
 
 ## 1. Scope and Targets
 
@@ -16,6 +17,7 @@ rosters, credits, and fees.
 | Venues | A few |
 | Client/server protocol | REST over HTTPS |
 | Screens | Responsive, desktop and mobile |
+| Languages | English (default), Simplified Chinese |
 
 ## 2. Technology Choices
 
@@ -25,6 +27,8 @@ rosters, credits, and fees.
 | Database | Supabase Postgres | Transactions and constraints for the credit ledger and roster. |
 | Authentication | Supabase Auth, email + password | Sign-up, email confirmation, and password reset are provided; no auth code to write. |
 | Styling | Tailwind CSS, mobile-first | Responsive layouts without a component library. |
+| Localization | Typed message dictionaries + built-in `Intl` | Two languages need no library; see §12 Internationalization. |
+| Email | Resend HTTP API via `fetch` | Urgent notifications only (§8). No SDK, so no new dependency. |
 | Hosting | Cloudflare Workers via `@opennextjs/cloudflare`, GitHub-connected | Free tier with no non-commercial restriction, so development and production share one environment. |
 | Domain tests | Vitest | Pure functions, no database needed. |
 | Integration tests | Vitest + local Supabase (Docker) | Covers transactions and locking. |
@@ -52,6 +56,8 @@ Next.js on Cloudflare Workers
     |-- app/api/...                         the REST API
     |-- src/domain/...                      pure business logic, no I/O
     |-- src/db/...                          Supabase queries and transactions
+    |-- src/i18n/...                        message dictionaries, t()
+    |-- fetch() --> Resend HTTP API         urgent email only (§8)
     |  supabase-js, service role key, server-side only
     v
 Supabase: Postgres + Auth
@@ -67,6 +73,7 @@ promote(roster): { promotedRegistrationId } | null
 classify(member, activity): "home_venue" | "cross_venue" | "non_alliance"
 settle(activity, registrations, noShowDecisions): SettlementResult
 canCancel(registration, activity, now): true | PastDeadline
+authorize(adminCtx, action, scope): void // throws FORBIDDEN_SCOPE
 ```
 
 Route handlers do the I/O: open a transaction, load state, call the domain function,
@@ -77,38 +84,40 @@ therefore unit-testable without a database.
 
 The browser never talks to Supabase directly. It holds a session JWT and calls the
 Next.js API; route handlers verify the JWT, resolve the caller's member record and
-role, and only then act. The service role key exists only in the server environment.
-There is exactly one code path that can mutate a roster or a ledger.
+admin context (§4.5), and only then act. The service role key exists only in the server
+environment. There is exactly one code path that can mutate a roster or a ledger.
 
 ## 4. Data Model
 
-Nine tables.
+Ten tables.
 
 | Table | Key columns |
 | --- | --- |
 | `alliance` | `id`, `name` |
 | `venue` | `id`, `name`, `alliance_id` |
-| `member` | `id`, `auth_user_id`, `name`, `email`, `alliance_id` (null = non-alliance), `membership_starts_on`, `membership_ends_on`, `role` |
+| `member` | `id`, `auth_user_id`, `name`, `email`, `alliance_id` (null = non-alliance), `membership_starts_on`, `membership_ends_on`, `is_system_admin` (default false), `locale` (default `en`) |
+| `venue_admin` | `member_id`, `venue_id`, `appointed_by`, `appointed_at`; primary key `(member_id, venue_id)` |
 | `activity` | `id`, `venue_id`, `activity_date`, `starts_at`, `ends_at`, `max_primary` (default 6), `max_waitlist`, `non_member_fee` (default 5.00), `registration_opens_at`, `registration_closes_at`, `cancellation_deadline_hours`, `status` |
-| `registration` | `id`, `activity_id`, `member_id`, `list`, `sort_at`, `checked_in_at`, `cancelled_at`, `created_at` |
+| `registration` | `id`, `activity_id`, `member_id`, `list`, `sort_at`, `checked_in_at`, `cancelled_at`, `no_show` (default false), `no_show_charged`, `created_at` |
 | `credit_ledger` | `id`, `member_id`, `delta`, `reason`, `activity_id`, `actor_id`, `created_at` |
 | `venue_fee` | `id`, `registration_id`, `amount`, `status`, `paid_at`, `actor_id` |
-| `notification` | `id`, `member_id`, `type`, `payload`, `read_at`, `created_at` |
-| `audit_log` | `id`, `actor_id`, `action`, `entity_type`, `entity_id`, `before`, `after`, `created_at` |
+| `notification` | `id`, `member_id`, `type`, `payload`, `read_at`, `email_status`, `created_at` |
+| `audit_log` | `id`, `actor_id`, `action`, `entity_type`, `entity_id`, `before`, `after`, `venue_id`, `alliance_id`, `created_at` |
 
 Enumerations:
 
-- `member.role`: `member` | `admin`
-- `activity.status`: `draft` | `open` | `closed` | `settled`
+- `activity.status`: `draft` | `open` | `closed` | `settled` | `cancelled`
 - `registration.list`: `primary` | `waitlist`
 - `venue_fee.status`: `unpaid` | `paid` | `waived`
+- `notification.email_status`: null (in-app only) | `pending` | `sent` | `failed`
 
 `activity.status` and registration timing are separate concerns. Registration is open
 when `status = 'open'` **and** now falls between `registration_opens_at` and
 `registration_closes_at`. An admin "closing registration" early (§12) narrows
 `registration_closes_at`; reopening widens it. Setting `status = 'closed'` is the
 distinct act of ending the activity so it can be settled, and it cannot be undone except
-by an admin reverting it before settlement.
+by an admin reverting it before settlement. `cancelled` means the activity will not run
+(§6.5); it is terminal and is never settled.
 
 Constraints:
 
@@ -167,20 +176,60 @@ Every write that changes seat allocation — register, cancel, admin roster edit
 takes `SELECT ... FOR UPDATE` on the `activity` row. Seat assignment is serialized per
 activity, so two members cannot both claim the last primary seat.
 
+### 4.5 Admin Roles and Scope
+
+Two admin levels (requirements §12, Administrator Roles):
+
+- **System admin**: `member.is_system_admin = true`. Any number.
+- **Venue admin**: one `venue_admin` row per venue they manage. A venue can have several
+  admins; a member can admin several venues.
+
+Each admin request loads an **admin context**: `{ isSystemAdmin, venueIds, allianceIds }`,
+where `allianceIds` are the alliances owning `venueIds`.
+
+| Action | System admin | Venue admin |
+| --- | --- | --- |
+| Create or edit alliances and venues; appoint or remove admins | ✓ | ✗ |
+| Create, edit, cancel, or reschedule activities; rosters; check-in; settlement | ✓ | own venues |
+| Mark fees paid or waive them | ✓ | fees from own venues' activities |
+| Manual credit adjustment and batch grant | ✓ | members of own `allianceIds` only |
+| View the audit log | all | rows whose `venue_id` is in `venueIds` or `alliance_id` is in `allianceIds` |
+| View members | all | members of own `allianceIds`, plus anyone registered at own venues |
+
+Enforcement:
+
+1. The route handler builds the admin context. A caller with neither flag nor
+   `venue_admin` rows gets `403 NOT_ADMIN`.
+2. Mutations call `authorize(ctx, action, { venueId?, allianceId? })` before writing.
+   Out of scope → `403 FORBIDDEN_SCOPE`.
+3. List endpoints filter their queries by the same context, so out-of-scope rows are never
+   returned.
+4. Every audit row stores the `venue_id` and/or `alliance_id` it concerns, so the scoped
+   audit view is a plain filter.
+5. Appointing or removing an admin writes an audit row. Removing or demoting the last
+   system admin → `409 LAST_SYSTEM_ADMIN`.
+
+Settlement at a venue still deducts credits from cross-venue participants (§6.3). That is
+automatic, not a manual adjustment, so a venue admin may run it.
+
+The first system admin is set by a seed SQL script. There is no bootstrap UI.
+
 ## 5. REST API
 
-`/api/admin/*` requires `role = admin`. All other routes are scoped to the caller.
+`/api/admin/*` requires an admin and is filtered by the admin context (§4.5). All other
+routes are scoped to the caller.
 
 ### 5.1 Member
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/me` | Profile, alliance, membership validity, credit totals (§11) |
+| GET | `/api/me` | Profile, alliance, membership validity, credit totals, no-show count (§11) |
+| PATCH | `/api/me` | Set `locale`; called by the language toggle (§12.1) |
 | GET | `/api/activities?from=&to=` | Open activities with seats remaining |
 | GET | `/api/activities/:id` | Detail, roster, caller's own status |
 | POST | `/api/activities/:id/registrations` | Register |
 | DELETE | `/api/registrations/:id` | Cancel |
-| GET | `/api/me/registrations` | "My Activities" (§11) |
+| GET | `/api/me/registrations` | "My Activities" (§11), including no-show flags |
 | GET | `/api/me/fees` | Own fee records and payment status |
 | GET | `/api/me/notifications` | In-app feed |
 | POST | `/api/notifications/:id/read` | Mark read |
@@ -190,15 +239,18 @@ activity, so two members cannot both claim the last primary seat.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/api/admin/activities` | Create with §2 configuration |
-| PATCH | `/api/admin/activities/:id` | Edit; close or reopen registration |
+| PATCH | `/api/admin/activities/:id` | Edit; close or reopen registration; reschedule; cancel (§6.5) |
 | GET | `/api/admin/activities/:id/roster` | Primary list, waiting list, check-in state |
 | POST | `/api/admin/activities/:id/check-ins` | Record attendance |
 | POST | `/api/admin/activities/:id/settle` | Close and settle (§10) |
-| PATCH | `/api/admin/registrations/:id` | Move list, reorder, admin-cancel |
+| PATCH | `/api/admin/registrations/:id` | Move list, reorder, admin-cancel (ignores the cancellation deadline) |
 | POST | `/api/admin/credits/grant` | Batch grant to selected members |
 | PATCH | `/api/admin/fees/:id` | Mark paid, or waive |
 | GET | `/api/admin/audit-log` | Filterable audit trail |
-| CRUD | `/api/admin/members`, `/venues`, `/alliances` | Reference data |
+| GET | `/api/admin/notifications?email_status=failed` | Emails that failed to send, for manual follow-up |
+| PUT / DELETE | `/api/admin/venues/:id/admins/:memberId` | Appoint or remove a venue admin (system admin only) |
+| PUT / DELETE | `/api/admin/system-admins/:memberId` | Grant or revoke system admin (system admin only) |
+| CRUD | `/api/admin/members`, `/venues`, `/alliances` | Reference data; venues and alliances are system admin only |
 
 ### 5.3 API Rules
 
@@ -236,12 +288,13 @@ Nothing is charged or deducted at this step, for any member type.
 
 1. Lock the `activity` row.
 2. Reject if now is within `cancellation_deadline_hours` of `starts_at` (§14.2) →
-   `409 PAST_CANCELLATION_DEADLINE`.
+   `409 PAST_CANCELLATION_DEADLINE`. This check applies only to the member's own cancel.
+   An admin cancel (`PATCH /api/admin/registrations/:id`) skips it and writes an audit row.
 3. Set `cancelled_at` on the registration.
 4. If the cancelled row was `primary`, find the earliest `sort_at` active waitlist row
    and set its `list = 'primary'`. Write a notification to the promoted member: "You have
    been automatically promoted from the waiting list to the official participant list for
-   this activity."
+   this activity." This notification is urgent, so it is also emailed (§8).
 5. Commit.
 
 Remaining waitlist members move up implicitly (§4.2). No credit is deducted or restored,
@@ -264,6 +317,10 @@ Settlement is triggered by the administrator, not a scheduler.
 | Non-alliance member, checked in | `venue_fee` row for `non_member_fee`, status `unpaid` |
 | No-show, admin chose Charge | Same settlement as if they had attended (ledger −1 for an alliance member, fee row for a non-alliance member), but with reason `No-Show` |
 | No-show, admin chose Don't Charge | No ledger or fee row; the no-show is still recorded |
+
+Every no-show row gets `no_show = true` and `no_show_charged` set to the admin's choice,
+whichever way they chose. No-show counts are derived from these columns, never stored.
+There is no automatic penalty.
 | Waitlist member, never promoted | Nothing (§10) |
 
 1. Set `status = 'settled'`, write one `audit_log` entry for the settlement, commit.
@@ -273,6 +330,32 @@ Settlement is triggered by the administrator, not a scheduler.
 The admin filters members by venue or alliance, selects all or a subset, and enters a
 delta and a reason. One transaction writes N `credit_ledger` rows and one `audit_log`
 entry recording the actor, the member count, the delta, and the reason.
+
+A venue admin may select only members of their own alliances (§4.5); any other member ID
+in the request → `403 FORBIDDEN_SCOPE`, and nothing is written.
+
+### 6.5 Activity Cancel and Reschedule
+
+Both go through `PATCH /api/admin/activities/:id`, holding the activity lock.
+
+**Cancel** (`status: cancelled`, allowed from `draft`, `open`, or `closed`):
+
+1. Set `cancelled_at` on every active registration. Promote no one.
+2. Write no ledger or fee rows.
+3. Notify every affected member with type `activity_cancelled` (urgent, emailed).
+4. Write one audit row. Later registration or settle attempts → `409 ACTIVITY_CANCELLED`.
+
+**Reschedule** (a change to `activity_date`, `starts_at`, or `ends_at`):
+
+1. Update the times and write an audit row with before and after.
+2. Notify every active registrant with type `activity_rescheduled`, carrying old and new
+   times in the payload (urgent, emailed).
+
+### 6.6 Appointing Admins
+
+System admins only. `PUT` inserts the `venue_admin` row or sets `is_system_admin`;
+`DELETE` removes or clears it. Each writes an audit row with the target member and venue.
+Revoking the last system admin is rejected (§4.5).
 
 ## 7. Resolved Requirement Conflicts
 
@@ -296,14 +379,27 @@ a bad settlement. No dedicated restore flow is built.
 
 ## 8. Notifications
 
-In-app only for v1. Events write a `notification` row: registration confirmed, placed on
+Every event writes a `notification` row, shown in-app: registration confirmed, placed on
 the waiting list, promoted from the waiting list, activity cancelled or rescheduled, fee
 generated, admin roster change affecting the member.
 
-**Known limitation:** a member promoted the night before an activity will not learn of it
-unless they open the app. The `notification` table carries `type` and a JSON `payload`,
-so adding an email channel later is a new delivery worker reading existing rows — no
-schema change.
+**Urgent types are also emailed:** `promoted`, `activity_cancelled`,
+`activity_rescheduled`. These are the events where a member who doesn't open the app
+would show up wrongly or miss a seat.
+
+1. The route writes the `notification` row inside its transaction, with
+   `email_status = 'pending'` for urgent types and null otherwise.
+2. After commit, the handler renders the email in the member's `member.locale` and sends
+   it through the Resend HTTP API with `fetch`. It then sets `email_status` to `sent` or
+   `failed`.
+3. A failed email never rolls back the roster change. Admins list `failed` rows
+   (`GET /api/admin/notifications?email_status=failed`) and follow up by hand.
+
+There is no retry queue. If failures become common, add a Cloudflare Cron Trigger that
+resends `pending` and `failed` rows. The API key lives only in the server environment.
+
+Notifications store no prose. The UI renders `type` + `payload` in the viewer's current
+language at read time (§12 Internationalization).
 
 ## 9. Error Handling
 
@@ -311,8 +407,8 @@ A single `DomainError` carrying a `code`, mapped to HTTP at the route boundary:
 
 | Code | Status |
 | --- | --- |
-| `ACTIVITY_FULL`, `ALREADY_REGISTERED`, `REGISTRATION_CLOSED`, `PAST_CANCELLATION_DEADLINE`, `ALREADY_SETTLED` | 409 |
-| `NOT_ADMIN`, `NOT_OWNER` | 403 |
+| `ACTIVITY_FULL`, `ALREADY_REGISTERED`, `REGISTRATION_CLOSED`, `PAST_CANCELLATION_DEADLINE`, `ALREADY_SETTLED`, `ACTIVITY_CANCELLED`, `LAST_SYSTEM_ADMIN` | 409 |
+| `NOT_ADMIN`, `NOT_OWNER`, `FORBIDDEN_SCOPE` | 403 |
 | `NOT_FOUND` | 404 |
 | Validation failure | 400 |
 
@@ -320,12 +416,16 @@ Route handlers own the transaction. A domain error rolls it back, so nothing par
 persists. Unexpected errors log with a request id and return an opaque 500; no stack
 trace reaches a browser.
 
+The API returns the `code`, not a sentence. The UI maps each code to a translated
+message (§12 Internationalization).
+
 ## 10. Testing
 
 | Layer | Tool | Covers |
 | --- | --- | --- |
-| Domain | Vitest, no database | Seat assignment, promotion order, classification, settlement outcomes per participant type, cancellation-deadline math, credit arithmetic |
-| Integration | Vitest + local Supabase (Docker) | Activity row locking under concurrent registration, settle-twice idempotency, audit rows landing with their change, ledger totals |
+| Domain | Vitest, no database | Seat assignment, promotion order, classification, settlement outcomes per participant type, cancellation-deadline math, credit arithmetic, `authorize` over every row of the §4.5 matrix |
+| Integration | Vitest + local Supabase (Docker) | Activity row locking under concurrent registration, settle-twice idempotency, audit rows landing with their change, ledger totals, venue admin list filtering, last-system-admin guard, email failure leaving the roster change committed (Resend stubbed) |
+| i18n | Vitest | Every error code, ledger reason code, and notification type has a message key, including email subjects and bodies for urgent types |
 | End-to-end | Deferred | Playwright once the UI stabilizes |
 
 Settlement is table-driven: participant type × attendance × no-show decision, with the
@@ -340,12 +440,68 @@ cards on mobile, with check-in toggles reachable by thumb.
 Member routes: activity list, activity detail and registration, my activities, my
 credits, my fees, notifications.
 Admin routes: activity list and editor, roster and check-in, settlement, members and
-batch credit grant, fees, audit log.
+batch credit grant, fees, audit log, failed emails. System admins also get venues,
+alliances, and admin appointments. Venue admins see the same screens, filtered to their
+scope (§4.5), and without the system-only sections.
 
-## 12. Out of Scope for v1
+## 12. Internationalization
 
-- Email and push notifications (§8 records the upgrade path)
+The UI supports English (`en`, default) and Simplified Chinese (`zh-CN`).
+
+### 12.1 Choosing the Language
+
+Each request resolves its locale in this order:
+
+1. The `locale` cookie.
+2. The browser's `Accept-Language` header.
+3. `en`.
+
+An EN / 中文 toggle in the header sets the cookie, calls `PATCH /api/me` to save
+`member.locale`, and refreshes the page. The cookie drives the UI; `member.locale` drives
+emails (§8), which are sent when the member is not present. The language is not in the
+URL.
+
+### 12.2 Mechanism
+
+- `src/i18n/en.ts` is the source of truth. `src/i18n/zh-CN.ts` is typed `typeof en`, so
+  a missing or extra key fails the build.
+- `getT(locale)` returns `t(key, vars?)` for Server Components. Client components get
+  `t` from a small context that the root layout fills with the active dictionary.
+- Dates and times use `Intl.DateTimeFormat`. The venue fee uses `Intl.NumberFormat`,
+  in USD in both languages. English plurals use `Intl.PluralRules`.
+
+No i18n library is used, keeping dependencies few (§2.1 Hosting Constraints, rule 3).
+
+### 12.3 Codes, Not Prose
+
+The layering rule (§3.1 The Layering Rule) extends to language: `src/domain/`, the database, and the API
+emit **codes**, and only the UI turns them into words.
+
+| Stored or returned as a code | Translated where |
+| --- | --- |
+| Error codes (§9 Error Handling) | UI, from the API's `code` field |
+| Ledger reason codes (§4.1 Credits Are a Ledger) | UI, when showing credit history |
+| Enum values (§4 Data Model) | UI labels |
+| Notification `type` + `payload` (§8 Notifications) | UI, at read time |
+
+As a result, the API is language-neutral, and the audit log and ledger keep stable
+English codes. A notification written while a member used English shows in Chinese if
+they switch later.
+
+### 12.4 Not Translated
+
+- **Admin-entered names** (alliances, venues, activities, members) show as typed.
+- **Notification emails** are translated, using `member.locale` (§8).
+- **Supabase Auth emails** (confirmation, password reset) come from Supabase templates,
+  which are single-language. Write them as bilingual text in the Supabase dashboard.
+  This is configuration, not code.
+
+## 13. Out of Scope for v1
+
+- Email for non-urgent notification types, push notifications, and automatic email retry (§8)
+- Automatic no-show penalties
 - Online payment for the $5 venue fee; admins confirm payment manually (§8 of requirements)
 - Member self-service profile editing beyond password reset
 - Scheduled or automatic settlement
 - Multi-organization tenancy
+- Languages beyond English and Simplified Chinese; translated admin-entered data

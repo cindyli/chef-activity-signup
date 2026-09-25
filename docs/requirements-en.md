@@ -308,6 +308,24 @@ Administrators should have special permissions to:
 
 All manual administrative changes should be recorded in an **audit log** for future reference.
 
+### Administrator Roles
+
+There are two levels of administrator:
+
+1. **System admins** manage the entire system. There can be several. System admins appoint
+   and remove venue admins and other system admins. The last system admin cannot be removed.
+2. **Venue admins** manage all matters related to their venue: activities, participant
+   lists, waiting lists, check-in, settlement, and fees. Each venue can have several venue
+   admins, and one person can be a venue admin for several venues.
+
+A venue admin may manually adjust activity credits only for members of the alliance that
+owns their venue. Settlement still deducts credits automatically from cross-venue
+participants at their venue. Any manual fix to another alliance's member goes to a system
+admin.
+
+A venue admin sees only their own venues' data, the members of their venues' alliances, and
+members registered for their venues' activities.
+
 ---
 
 ## 13. Core Automation Logic
@@ -351,15 +369,23 @@ The most important logic of the School Alliance Sign-Up System can be summarized
 
 To minimize future disputes regarding activity credits, fees, and participant lists, the following features are strongly recommended.
 
+All five features below are adopted for v1. Each **Decision** note records how.
+
 ### 14.1 Check-In Function
 
 The final activity-credit deduction and fee calculation should preferably be based on **actual check-in/attendance**, rather than solely on the registration list.
+
+**Decision:** Credits and fees are settled from check-in only. Nothing is deducted at
+registration or promotion.
 
 ### 14.2 Cancellation Deadline
 
 The administrator should be able to configure a cancellation deadline, such as:
 
 > Members may not cancel their registration within X hours before the activity starts.
+
+**Decision:** An administrator may still cancel a registration for a member after the
+deadline. This is an audited override. The waiting list still promotes automatically.
 
 ### 14.3 No-Show Records
 
@@ -373,6 +399,10 @@ the system should record the member as a:
 
 **No-Show**
 
+**Decision:** At settlement, the administrator chooses **Charge** or **Don't Charge** for
+each no-show, and the system stores that choice. Members see their own no-shows, and
+administrators see each member's no-show count. There is no automatic penalty.
+
 ### 14.4 Automatic Notifications
 
 The system should automatically send notifications for events such as:
@@ -385,6 +415,12 @@ The system should automatically send notifications for events such as:
 * Fee generation
 * Other important registration/status changes
 
+**Decision:** Every event appears in the app. Urgent events also send an email:
+
+* Promotion from the waiting list
+* Activity cancellation
+* Activity date/time change
+
 ### 14.5 Administrative Audit Log
 
 All manual administrative changes should record:
@@ -393,6 +429,9 @@ All manual administrative changes should record:
 * Date and time of the change
 * Information before the change
 * Information after the change
+
+Appointing or removing an administrator is also recorded. A venue admin sees only the audit
+entries for their own venues and their alliances' members.
 
 This will help minimize disputes regarding:
 
